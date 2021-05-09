@@ -247,11 +247,14 @@
   "noTransferMethod": {
     "message": "No transfer method"
   },
-  "tokenDoesNotMatchStandard": {
-    "message": "Provided token contract doesn't match $standard$ standard",
+  "tokenDoesNotMatchAnyStandard": {
+    "message": "Provided token contract doesn't match FA1.2 ($fa12Error$) or FA2 standard ($fa2Error$)",
     "placeholders": {
-      "standard": {
+      "fa12Error": {
         "content": "$1"
+      },
+      "fa2Error": {
+        "content": "$2"
       }
     }
   },

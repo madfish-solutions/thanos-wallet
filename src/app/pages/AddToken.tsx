@@ -1,17 +1,18 @@
 import React, {
   FC,
-  memo,
   ReactNode,
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
 import { WalletContract } from "@taquito/taquito";
 import classNames from "clsx";
-import { Controller, FormContextValues, useForm } from "react-hook-form";
+import { Controller, useForm } from "react-hook-form";
 
 import Alert from "app/atoms/Alert";
+import AssetField from "app/atoms/AssetField";
 import FormField from "app/atoms/FormField";
 import FormSubmitButton from "app/atoms/FormSubmitButton";
 import NoSpaceField from "app/atoms/NoSpaceField";
@@ -34,9 +35,10 @@ import {
   getAssetKey,
   fetchTokenMetadata,
   MetadataParseError,
+  TokenMetadata,
+  UndefinedTokenError,
 } from "lib/temple/front";
 import { withErrorHumanDelay } from "lib/ui/humanDelay";
-import useSafeState from "lib/ui/useSafeState";
 import { navigate } from "lib/woozie";
 
 const AddToken: FC = () => (
@@ -54,72 +56,60 @@ const AddToken: FC = () => (
 
 export default AddToken;
 
-const TOKEN_TYPES = [
-  {
-    type: TempleAssetType.FA1_2 as const,
-    name: "FA 1.2",
-  },
-  {
-    type: TempleAssetType.FA2 as const,
-    name: "FA 2",
-  },
-];
-
 type TempleCustomTokenType = TempleAssetType.FA1_2 | TempleAssetType.FA2;
-type FormData = {
+type TopFormData = {
   address: string;
   id?: number;
-  symbol: string;
-  name: string;
-  decimals: number;
-  iconUrl: string;
-  type: TempleCustomTokenType;
 };
 
 const Form: FC = () => {
-  const { addToken } = useTokens();
   const tezos = useTezos();
   const { id: networkId } = useNetwork();
-  const formAnalytics = useFormAnalytics('AddToken');
 
   const {
     control,
     register,
-    handleSubmit,
     errors,
-    formState,
     watch,
     setValue,
     triggerValidation,
-  } = useForm<FormData>({
-    defaultValues: { decimals: 0, type: TOKEN_TYPES[0].type, id: 0 },
+  } = useForm<TopFormData>({
+    defaultValues: { id: 0 },
+    reValidateMode: "onBlur",
   });
   const contractAddress = watch("address");
-  const tokenType = watch("type");
+  const previousAddressRef = useRef<string>();
+  const previousNetworkIdRef = useRef(networkId);
   const tokenId = watch("id");
-  const [submitError, setSubmitError] = useState<ReactNode>(null);
+  const previousTokenIdRef = useRef<number | undefined>(0);
+
   const [tokenDataError, setTokenDataError] = useState<ReactNode>(null);
+  const [tokenType, setTokenType] = useState<TempleCustomTokenType>();
+  const tokenTypeRef = useRef<TempleCustomTokenType>();
   const [tokenValidationError, setTokenValidationError] = useState<ReactNode>(
     null
   );
-  const [bottomSectionVisible, setBottomSectionVisible] = useSafeState(false);
   const [loadingToken, setLoadingToken] = useState(false);
+  const [bottomFormInitialData, setBottomFormInitialData] = useState<
+    Partial<TokenMetadata>
+  >();
 
   useEffect(() => {
     setTokenValidationError(null);
-    setBottomSectionVisible(false);
-    if (
-      validateContractAddress(contractAddress) !== true ||
-      tokenId === undefined ||
-      String(tokenId) === ""
-    ) {
+    setBottomFormInitialData(undefined);
+    if (validateContractAddress(contractAddress) !== true) {
+      setTokenType(undefined);
+      tokenTypeRef.current = undefined;
+      previousAddressRef.current = undefined;
+      previousTokenIdRef.current = 0;
+      setBottomFormInitialData(undefined);
+      previousNetworkIdRef.current = networkId;
       return;
     }
     triggerValidation("address");
     (async () => {
       try {
         setTokenDataError(null);
-        setSubmitError(null);
         setLoadingToken(true);
 
         let contract: WalletContract;
@@ -134,17 +124,88 @@ const Form: FC = () => {
 
         let tokenData;
 
-        try {
-          /**
-           * Assert token standard
-           */
-          if (tokenType === TempleAssetType.FA1_2) {
-            await assertTokenType(tokenType, contract, tezos);
-          } else {
-            await assertTokenType(tokenType, contract, tezos, tokenId!);
+        if (
+          previousAddressRef.current !== contractAddress ||
+          previousNetworkIdRef.current !== networkId
+        ) {
+          try {
+            await assertTokenType(TempleAssetType.FA1_2, contract, tezos);
+            tokenTypeRef.current = TempleAssetType.FA1_2;
+            setTokenType(TempleAssetType.FA1_2);
+          } catch (fa12Error) {
+            try {
+              await assertTokenType(TempleAssetType.FA2, contract, tezos, 0);
+              tokenTypeRef.current = TempleAssetType.FA2;
+              setTokenType(TempleAssetType.FA2);
+              setValue("id", 0);
+            } catch (fa2Error) {
+              if (fa2Error instanceof UndefinedTokenError) {
+                tokenTypeRef.current = TempleAssetType.FA2;
+                setTokenType(TempleAssetType.FA2);
+                setValue("id", undefined);
+              } else {
+                setTokenType(undefined);
+                setValue("id", 0);
+                setBottomFormInitialData(undefined);
+                if (fa2Error instanceof NotMatchingStandardError) {
+                  throw new TokenValidationError(
+                    t("tokenDoesNotMatchAnyStandard", [
+                      fa12Error.message as string,
+                      fa2Error.message,
+                    ])
+                  );
+                } else {
+                  throw new TokenValidationError(fa2Error.message);
+                }
+              }
+            }
           }
+        } else if (
+          previousTokenIdRef.current !== tokenId &&
+          tokenTypeRef.current === TempleAssetType.FA2
+        ) {
+          if (tokenId === undefined) {
+            setBottomFormInitialData(undefined);
+            setLoadingToken(false);
+            previousAddressRef.current = contractAddress;
+            previousTokenIdRef.current = tokenId;
+            return;
+          } else {
+            try {
+              await assertTokenType(
+                TempleAssetType.FA2,
+                contract,
+                tezos,
+                tokenId!
+              );
+            } catch (e) {
+              throw new TokenValidationError(e.message);
+            }
+          }
+        } else {
+          previousAddressRef.current = contractAddress;
+          previousTokenIdRef.current = tokenId;
+          return;
+        }
 
-          tokenData = await fetchTokenMetadata(tezos, contractAddress, tokenId);
+        const newTokenType = tokenTypeRef.current;
+
+        if (!newTokenType) {
+          return;
+        }
+
+        try {
+          if (newTokenType === TempleAssetType.FA1_2) {
+            await assertTokenType(newTokenType, contract, tezos);
+            tokenData = await fetchTokenMetadata(tezos, contractAddress);
+          } else {
+            await assertTokenType(newTokenType, contract, tezos, tokenId!);
+            tokenData = await fetchTokenMetadata(
+              tezos,
+              contractAddress,
+              tokenId!
+            );
+          }
         } catch (err) {
           if (err instanceof MetadataParseError) {
             throw err;
@@ -152,7 +213,7 @@ const Form: FC = () => {
             throw new TokenValidationError(
               `${t(
                 "tokenDoesNotMatchStandard",
-                tokenType === TempleAssetType.FA1_2 ? "FA1.2" : "FA2"
+                newTokenType === TempleAssetType.FA1_2 ? "FA1.2" : "FA2"
               )}: ${err.message}`
             );
           } else {
@@ -160,13 +221,12 @@ const Form: FC = () => {
           }
         }
 
-        setValue([
-          { symbol: tokenData.symbol.substr(0, 8) },
-          { name: tokenData.name.substr(0, 50) },
-          { decimals: tokenData.decimals },
-          { iconUrl: tokenData.iconUrl },
-        ]);
-        setBottomSectionVisible(true);
+        setBottomFormInitialData({
+          symbol: tokenData.symbol.substr(0, 5),
+          name: tokenData.name.substr(0, 50),
+          decimals: tokenData.decimals,
+          iconUrl: tokenData.iconUrl,
+        });
       } catch (e) {
         withErrorHumanDelay(e, () => {
           if (e instanceof TokenValidationError) {
@@ -179,41 +239,172 @@ const Form: FC = () => {
             ) : (
               <T id="unknownParseErrorOccurred" />
             );
-          setValue([{ symbol: "" }, { name: "" }, { decimals: 0 }]);
+          setBottomFormInitialData({
+            symbol: "",
+            name: "",
+            decimals: 0,
+          });
           setTokenDataError(errorMessage);
-          setBottomSectionVisible(true);
         });
       } finally {
         setLoadingToken(false);
+        previousAddressRef.current = contractAddress;
+        previousTokenIdRef.current = tokenId;
+        previousNetworkIdRef.current = networkId;
       }
     })();
-  }, [
-    contractAddress,
-    tezos,
-    setValue,
-    setBottomSectionVisible,
-    networkId,
-    tokenType,
-    triggerValidation,
-    tokenId,
-  ]);
+  }, [contractAddress, tezos, setValue, networkId, triggerValidation, tokenId]);
 
   const cleanContractAddress = useCallback(() => {
     setValue("address", "");
     triggerValidation("address");
   }, [setValue, triggerValidation]);
 
+  const isFA2Token = tokenType === TempleAssetType.FA2;
+
+  return (
+    <div className="w-full max-w-sm mx-auto my-8">
+      <form>
+        <NoSpaceField
+          ref={register({
+            required: t("required"),
+            validate: validateContractAddress,
+          })}
+          name="address"
+          id="addtoken-address"
+          textarea
+          rows={2}
+          cleanable={Boolean(contractAddress)}
+          onClean={cleanContractAddress}
+          label={t("address")}
+          labelDescription={t("addressOfDeployedTokenContract")}
+          placeholder={t("tokenContractPlaceholder")}
+          errorCaption={errors.address?.message}
+          containerClassName={isFA2Token ? "mb-4" : "mb-6"}
+        />
+
+        <div
+          className={classNames(
+            "mb-6",
+            "flex flex-col",
+            !isFA2Token && "hidden"
+          )}
+        >
+          <Controller
+            as={AssetField}
+            control={control}
+            rules={{
+              min: { value: 0, message: t("nonNegativeIntMessage") },
+              required: isFA2Token ? t("required") : undefined,
+            }}
+            name="id"
+            id="token-id"
+            label={t("tokenId")}
+            labelDescription={t("tokenIdInputDescription")}
+            placeholder="0"
+            errorCaption={errors.id?.message}
+          />
+        </div>
+      </form>
+
+      {tokenValidationError && (
+        <Alert
+          type="error"
+          title={t("error")}
+          autoFocus
+          description={tokenValidationError}
+          className="mb-8"
+        />
+      )}
+
+      {tokenDataError && (
+        <Alert
+          type="warn"
+          title={t("failedToParseMetadata")}
+          autoFocus
+          description={tokenDataError}
+          className="mb-8"
+        />
+      )}
+
+      <BottomSection
+        hidden={!bottomFormInitialData}
+        address={contractAddress}
+        initialData={bottomFormInitialData}
+        tokenType={tokenType}
+        id={tokenId}
+      />
+
+      {loadingToken && (
+        <div className="my-8 w-full flex items-center justify-center pb-4">
+          <div>
+            <Spinner theme="gray" className="w-20" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+type BottomSectionProps = {
+  address: string;
+  hidden?: boolean;
+  initialData?: Partial<TokenMetadata>;
+  tokenType?: TempleCustomTokenType;
+  id?: number;
+};
+
+const urlValidationRules = {
+  validate: (val: string) => {
+    if (!val) return true;
+    if (
+      val.match(/(https:\/\/.*\.(?:png|jpg|jpeg|gif|webp))/i) ||
+      val.match(/(ipfs:\/\/.*)/i)
+    ) {
+      return true;
+    }
+
+    return (
+      <ul className="list-disc list-inside">
+        <T id="validImageURL">{(message) => <li>{message}</li>}</T>
+        <T id="onlyHTTPS">{(message) => <li>{message}</li>}</T>
+        <T id="formatsAllowed">{(message) => <li>{message}</li>}</T>
+        <T id="orIPFSImageURL">{(message) => <li>{message}</li>}</T>
+      </ul>
+    );
+  },
+};
+
+const BottomSection: FC<BottomSectionProps> = (props) => {
+  const { address, hidden, initialData, tokenType, id } = props;
+  const {
+    handleSubmit,
+    register,
+    errors,
+    formState,
+    reset,
+  } = useForm<TokenMetadata>({
+    defaultValues: initialData,
+  });
+  const prevInitialDataRef = useRef(initialData);
+  const formAnalytics = useFormAnalytics("AddToken");
+
+  const { addToken } = useTokens();
+  const [submitError, setSubmitError] = useState<React.ReactNode>(null);
+
+  useEffect(() => {
+    if (prevInitialDataRef.current !== initialData) {
+      reset(initialData);
+      setSubmitError(null);
+    }
+    prevInitialDataRef.current = initialData;
+  }, [initialData, reset]);
+
   const onSubmit = useCallback(
-    async ({
-      address,
-      symbol,
-      name,
-      decimals,
-      iconUrl,
-      type: tokenType,
-      id,
-    }: FormData) => {
-      if (formState.isSubmitting) return;
+    async ({ symbol, name, decimals, iconUrl }: TokenMetadata) => {
+      if (formState.isSubmitting) {
+        return;
+      }
 
       setSubmitError(null);
 
@@ -232,14 +423,14 @@ const Form: FC = () => {
         const newToken: TempleToken =
           tokenType === TempleAssetType.FA1_2
             ? {
-              type: TempleAssetType.FA1_2,
-              ...tokenCommonProps,
-            }
+                type: TempleAssetType.FA1_2,
+                ...tokenCommonProps,
+              }
             : {
-              type: TempleAssetType.FA2,
-              id: Number(id!),
-              ...tokenCommonProps,
-            };
+                type: TempleAssetType.FA2,
+                id: Number(id!),
+                ...tokenCommonProps,
+              };
 
         await addToken(newToken);
         const assetKey = getAssetKey(newToken);
@@ -265,185 +456,14 @@ const Form: FC = () => {
         setSubmitError(err.message);
       }
     },
-    [formState.isSubmitting, addToken, formAnalytics]
+    [addToken, address, formState.isSubmitting, id, tokenType, formAnalytics]
   );
-
-  const isFA12Token = tokenType === TempleAssetType.FA1_2;
 
   return (
     <form
-      className="w-full max-w-sm mx-auto my-8"
+      className={classNames("w-full", { hidden })}
       onSubmit={handleSubmit(onSubmit)}
     >
-      <div className="mb-4 flex flex-col">
-        <h2 className={classNames("mb-4", "leading-tight", "flex flex-col")}>
-          <span className="text-base font-semibold text-gray-700">
-            <T id="tokenType" />
-          </span>
-        </h2>
-
-        <Controller name="type" as={TokenTypeSelect} control={control} />
-      </div>
-
-      <NoSpaceField
-        ref={register({
-          required: t("required"),
-          validate: validateContractAddress,
-        })}
-        name="address"
-        id="addtoken-address"
-        textarea
-        rows={2}
-        cleanable={Boolean(contractAddress)}
-        onClean={cleanContractAddress}
-        label={t("address")}
-        labelDescription={t("addressOfDeployedTokenContract")}
-        placeholder={t("tokenContractPlaceholder")}
-        errorCaption={errors.address?.message}
-        containerClassName={isFA12Token ? "mb-6" : "mb-4"}
-      />
-
-      <div
-        className={classNames("mb-6", "flex flex-col", isFA12Token && "hidden")}
-      >
-        <FormField
-          ref={register({
-            min: { value: 0, message: t("nonNegativeIntMessage") },
-            required: isFA12Token ? undefined : t("required"),
-          })}
-          min={0}
-          type="number"
-          name="id"
-          id="token-id"
-          label={t("tokenId")}
-          labelDescription={t("tokenIdInputDescription")}
-          placeholder="0"
-          errorCaption={errors.id?.message}
-        />
-      </div>
-
-      {tokenValidationError && (
-        <Alert
-          type="error"
-          title={t("error")}
-          autoFocus
-          description={tokenValidationError}
-          className="mb-8"
-        />
-      )}
-
-      {tokenDataError && (
-        <Alert
-          type="warn"
-          title={t("failedToParseMetadata")}
-          autoFocus
-          description={tokenDataError}
-          className="mb-8"
-        />
-      )}
-
-      <div
-        className={classNames("w-full", {
-          hidden: !bottomSectionVisible || loadingToken,
-        })}
-      >
-        <BottomSection
-          register={register}
-          errors={errors}
-          formState={formState}
-          submitError={submitError}
-        />
-      </div>
-
-      {loadingToken && (
-        <div className="my-8 w-full flex items-center justify-center pb-4">
-          <div>
-            <Spinner theme="gray" className="w-20" />
-          </div>
-        </div>
-      )}
-    </form>
-  );
-};
-
-type TokenTypeSelectProps = {
-  value?: TempleCustomTokenType;
-  onChange: (newValue: TempleCustomTokenType) => void;
-};
-
-const TokenTypeSelect = memo<TokenTypeSelectProps>((props) => {
-  const { value, onChange } = props;
-
-  return (
-    <div
-      className={classNames(
-        "rounded-md overflow-hidden",
-        "border-2 bg-gray-100",
-        "flex flex-col",
-        "text-gray-700 text-sm leading-tight"
-      )}
-    >
-      {TOKEN_TYPES.map(({ type: tokenType }, index) => (
-        <TokenTypeOption
-          key={tokenType}
-          active={tokenType === value}
-          last={index === TOKEN_TYPES.length - 1}
-          value={tokenType}
-          onClick={onChange}
-        />
-      ))}
-    </div>
-  );
-});
-
-type TokenTypeOptionProps = {
-  active: boolean;
-  last: boolean;
-  value: TempleCustomTokenType;
-  onClick: (value: TempleCustomTokenType) => void;
-};
-
-const TokenTypeOption: FC<TokenTypeOptionProps> = (props) => {
-  const { active, last, value, onClick } = props;
-
-  const handleClick = useCallback(() => onClick(value), [onClick, value]);
-
-  return (
-    <button
-      type="button"
-      className={classNames(
-        "block w-full",
-        "overflow-hidden",
-        !last && "border-b border-gray-200",
-        active ? "bg-gray-300" : "hover:bg-gray-200 focus:bg-gray-200",
-        "flex items-center",
-        "text-gray-700 font-medium",
-        "transition ease-in-out duration-200",
-        "focus:outline-none",
-        "opacity-90 hover:opacity-100"
-      )}
-      style={{
-        padding: "0.4rem 0.375rem 0.4rem 0.375rem",
-      }}
-      onClick={handleClick}
-    >
-      {TOKEN_TYPES.find(({ type }) => type === value)!.name}
-    </button>
-  );
-};
-
-type BottomSectionProps = Pick<
-  FormContextValues,
-  "register" | "errors" | "formState"
-> & {
-  submitError?: ReactNode;
-};
-
-const BottomSection: FC<BottomSectionProps> = (props) => {
-  const { register, errors, formState, submitError } = props;
-
-  return (
-    <>
       <FormField
         ref={register({
           required: t("required"),
@@ -466,11 +486,9 @@ const BottomSection: FC<BottomSectionProps> = (props) => {
       <FormField
         ref={register({
           required: t("required"),
-          validate: (val: string) => {
-            if (!val || val.length < 3 || val.length > 50) {
-              return t("tokenNamePatternDescription");
-            }
-            return true;
+          pattern: {
+            value: /^[a-zA-Z0-9 _-]{3,50}$/,
+            message: t("tokenNamePatternDescription"),
           },
         })}
         name="name"
@@ -497,26 +515,7 @@ const BottomSection: FC<BottomSectionProps> = (props) => {
       />
 
       <FormField
-        ref={register({
-          validate: (val: string) => {
-            if (!val) return true;
-            if (
-              val.match(/(https:\/\/.*\.(?:png|jpg|jpeg|gif|webp))/i) ||
-              val.match(/(ipfs:\/\/.*)/i)
-            ) {
-              return true;
-            }
-
-            return (
-              <ul className="list-disc list-inside">
-                <T id="validImageURL">{(message) => <li>{message}</li>}</T>
-                <T id="onlyHTTPS">{(message) => <li>{message}</li>}</T>
-                <T id="formatsAllowed">{(message) => <li>{message}</li>}</T>
-                <T id="orIPFSImageURL">{(message) => <li>{message}</li>}</T>
-              </ul>
-            );
-          },
-        })}
+        ref={register(urlValidationRules)}
         name="iconUrl"
         id="addtoken-iconUrl"
         label={
@@ -554,9 +553,8 @@ const BottomSection: FC<BottomSectionProps> = (props) => {
           </FormSubmitButton>
         )}
       </T>
-    </>
+    </form>
   );
 };
 
-class TokenValidationError extends Error {
-}
+class TokenValidationError extends Error {}
