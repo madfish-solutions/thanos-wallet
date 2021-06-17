@@ -1,4 +1,4 @@
-import React, { FC, useCallback, useMemo } from "react";
+import React, { FC, useCallback, useEffect, useMemo } from "react";
 
 import { localForger } from "@taquito/local-forging";
 import classNames from "clsx";
@@ -81,6 +81,10 @@ const InternalConfirmation: FC<InternalConfiramtionProps> = ({
     getContentToParse,
     { suspense: true }
   );
+  const forceHidePreview =
+    !(contentToParse instanceof Array) &&
+    contentToParse &&
+    contentToParse.contents.length === 0;
 
   const networkRpc =
     payload.type === "operations" ? payload.networkRpc : currentNetworkRpc;
@@ -147,6 +151,16 @@ const InternalConfirmation: FC<InternalConfiramtionProps> = ({
       ];
     }
 
+    if (forceHidePreview) {
+      return [
+        {
+          key: "bytes",
+          name: t("bytes"),
+          Icon: HashIcon,
+        },
+      ];
+    }
+
     return [
       {
         key: "preview",
@@ -161,7 +175,7 @@ const InternalConfirmation: FC<InternalConfiramtionProps> = ({
         testID: InternalConfirmationSelectors.BytesTab,
       },
     ];
-  }, [payload]);
+  }, [payload, forceHidePreview]);
 
   const [spFormat, setSpFormat] = useSafeState(signPayloadFormats[0]);
   const [error, setError] = useSafeState<any>(null);
@@ -178,6 +192,12 @@ const InternalConfirmation: FC<InternalConfiramtionProps> = ({
       (payload.type === "operations" && payload.estimates?.[0].storageLimit) ||
         0
     );
+
+  useEffect(() => {
+    if (!signPayloadFormats.some(({ key }) => key === spFormat.key)) {
+      setSpFormat(signPayloadFormats[0]);
+    }
+  }, [spFormat, signPayloadFormats, setSpFormat]);
 
   const confirm = useCallback(
     async (confirmed: boolean) => {

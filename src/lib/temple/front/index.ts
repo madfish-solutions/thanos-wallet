@@ -3,6 +3,7 @@ export * from "lib/temple/helpers";
 export * from "lib/temple/assets";
 export * from "lib/temple/contract";
 export * from "lib/temple/operation";
+export * from "lib/temple/front/gas-station";
 export * from "lib/temple/activity";
 export * from "lib/temple/front/tzdns";
 export * from "lib/temple/front/provider";

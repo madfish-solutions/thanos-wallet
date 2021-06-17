@@ -7,6 +7,8 @@ import React, {
   MutableRefObject,
   SVGProps,
   useCallback,
+  useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -21,6 +23,7 @@ import {
 } from "react-hook-form";
 
 import AssetField from "app/atoms/AssetField";
+import FormCheckbox from "app/atoms/FormCheckbox";
 import Money from "app/atoms/Money";
 import Name from "app/atoms/Name";
 import { ReactComponent as CoffeeIcon } from "app/icons/coffee.svg";
@@ -31,7 +34,7 @@ import CustomSelect, { OptionRenderProps } from "app/templates/CustomSelect";
 import { AnalyticsEventCategory, useAnalytics } from "lib/analytics";
 import { toLocalFixed } from "lib/i18n/numbers";
 import { T, t } from "lib/i18n/react";
-import { TEZ_ASSET } from "lib/temple/front";
+import { mutezToTz, TempleToken, TEZ_ASSET, tzToMutez } from "lib/temple/front";
 
 import { AdditionalFeeInputSelectors } from "./AdditionalFeeInput.selectors";
 
@@ -45,8 +48,10 @@ export type AdditionalFeeInputProps = Pick<
   ControllerProps<ComponentType>,
   "name" | "control" | "onChange"
 > & {
-  assetSymbol: string;
+  assetSymbol?: string;
   baseFee?: BigNumber | Error;
+  token?: TempleToken;
+  tokenPrice?: number;
   error?: FieldError;
   id: string;
 };
@@ -55,15 +60,15 @@ type FeeOption = {
   Icon?: FunctionComponent<SVGProps<SVGSVGElement>>;
   descriptionI18nKey: string;
   type: "minimal" | "fast" | "rocket" | "custom";
-  amount?: number;
+  amount?: BigNumber;
 };
 
-const feeOptions: FeeOption[] = [
+const xtzFeeOptions: FeeOption[] = [
   {
     Icon: CoffeeIcon,
     descriptionI18nKey: "minimalFeeDescription",
     type: "minimal",
-    amount: 1e-4,
+    amount: new BigNumber(1e-4),
   },
   {
     Icon: ({ className, ...rest }) => (
@@ -74,13 +79,13 @@ const feeOptions: FeeOption[] = [
     ),
     descriptionI18nKey: "fastFeeDescription",
     type: "fast",
-    amount: 1.5e-4,
+    amount: new BigNumber(1.5e-4),
   },
   {
     Icon: RocketIcon,
     descriptionI18nKey: "rocketFeeDescription",
     type: "rocket",
-    amount: 2e-4,
+    amount: new BigNumber(2e-4),
   },
   {
     Icon: ({ className, ...rest }) => (
@@ -97,14 +102,25 @@ const feeOptions: FeeOption[] = [
 const getFeeOptionId = (option: FeeOption) => option.type;
 
 const AdditionalFeeInput: FC<AdditionalFeeInputProps> = (props) => {
-  const { assetSymbol, baseFee, control, error, id, name, onChange } = props;
+  const {
+    assetSymbol,
+    baseFee,
+    control,
+    error,
+    id,
+    name,
+    onChange,
+    token,
+    tokenPrice,
+  } = props;
   const { trackEvent } = useAnalytics();
 
-  const validateAdditionalFee = useCallback((v?: number) => {
-    if (v === undefined) {
+  const validateAdditionalFee = useCallback((v?: AdditionalFeeValue) => {
+    if (v?.amount === undefined) {
       return t("required");
     }
-    if (v <= 0) {
+    const bn = new BigNumber(v.amount);
+    if (bn.lte(0)) {
       return t("amountMustBePositive");
     }
     return true;
@@ -134,37 +150,42 @@ const AdditionalFeeInput: FC<AdditionalFeeInputProps> = (props) => {
       assetSymbol={assetSymbol}
       onFocus={focusCustomFeeInput}
       label={t("additionalFee")}
-      labelDescription={
-        baseFee instanceof BigNumber && (
-          <T
-            id="feeInputDescription"
-            substitutions={[
-              <Fragment key={0}>
-                <span className="font-normal">{toLocalFixed(baseFee)}</span>
-              </Fragment>,
-            ]}
-          />
-        )
-      }
+      baseFee={baseFee}
       placeholder="0"
       errorCaption={error?.message}
       rules={{
         validate: validateAdditionalFee,
       }}
+      token={token}
+      tokenPrice={tokenPrice}
     />
   );
 };
 
 export default AdditionalFeeInput;
 
-type AdditionalFeeInputContentProps = AssetFieldProps & {
-  customFeeInputRef: MutableRefObject<HTMLInputElement | null>;
+export type AdditionalFeeValue = {
+  inToken: boolean;
+  amount?: string;
 };
+
+type AdditionalFeeInputContentProps = Omit<
+  AssetFieldProps,
+  "onChange" | "value" | "labelDescription"
+> &
+  Pick<AdditionalFeeInputProps, "token" | "tokenPrice" | "baseFee"> & {
+    customFeeInputRef: MutableRefObject<HTMLInputElement | null>;
+    onChange?: (newValue: AdditionalFeeValue) => void;
+    value?: AdditionalFeeValue;
+  };
+
+const defaultAdditionalFeeValue: AdditionalFeeValue = { inToken: false };
 
 const AdditionalFeeInputContent: FC<AdditionalFeeInputContentProps> = (
   props
 ) => {
   const {
+    baseFee,
     className,
     containerClassName,
     customFeeInputRef,
@@ -172,23 +193,122 @@ const AdditionalFeeInputContent: FC<AdditionalFeeInputContentProps> = (
     assetSymbol,
     id,
     label,
-    labelDescription,
-    value,
+    token,
+    tokenPrice,
+    value = defaultAdditionalFeeValue,
     ...restProps
   } = props;
+  const { inToken, amount: amountFromValue } = value;
+
+  const actualInToken = token ? inToken : false;
+  useEffect(() => {
+    if (actualInToken !== inToken) {
+      onChange?.({ amount: amountFromValue, inToken: actualInToken });
+    }
+  }, [amountFromValue, inToken, actualInToken, onChange]);
+
+  const tokenFeeOptions = useMemo(() => {
+    if (!token) {
+      return [];
+    }
+    return xtzFeeOptions.map((option) => ({
+      ...option,
+      amount:
+        option.amount &&
+        tzToMutez(option.amount)
+          .multipliedBy(tokenPrice ?? 1)
+          .decimalPlaces(token.decimals),
+    }));
+  }, [token, tokenPrice]);
+
+  const feeOptions = token && inToken ? tokenFeeOptions : xtzFeeOptions;
 
   const [selectedPreset, setSelectedPreset] = useState<FeeOption["type"]>(
-    feeOptions.find(({ amount }) => amount === value)?.type || "custom"
+    feeOptions.find(
+      ({ amount }) =>
+        amountFromValue !== undefined && amount?.eq(amountFromValue)
+    )?.type || "custom"
   );
   const handlePresetSelected = useCallback(
     (newType: FeeOption["type"]) => {
       setSelectedPreset(newType);
       const option = feeOptions.find(({ type }) => type === newType)!;
       if (option.amount) {
-        onChange?.(`${option.amount}`);
+        onChange?.({ inToken, amount: `${option.amount}` });
       }
     },
-    [onChange]
+    [onChange, feeOptions, inToken]
+  );
+  const handleAmountChange = useCallback(
+    (newAmount?: string) => {
+      onChange?.({ inToken, amount: newAmount });
+    },
+    [onChange, inToken]
+  );
+  const handleInTokenChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const newInToken = e.target.checked;
+      let newAmount = amountFromValue;
+      if (newAmount && selectedPreset === "custom") {
+        newAmount = newInToken
+          ? tzToMutez(newAmount)
+              .multipliedBy(tokenPrice ?? 1)
+              .decimalPlaces(token!.decimals)
+              .toString()
+          : mutezToTz(
+              new BigNumber(newAmount).dividedBy(tokenPrice ?? 1)
+            ).toString();
+      } else {
+        const newOptions = newInToken ? tokenFeeOptions : xtzFeeOptions;
+        newAmount = newOptions
+          .find(({ type }) => type === selectedPreset)!
+          .amount?.toString();
+      }
+      onChange?.({ inToken: e.target.checked, amount: newAmount });
+    },
+    [
+      onChange,
+      amountFromValue,
+      selectedPreset,
+      token,
+      tokenFeeOptions,
+      tokenPrice,
+    ]
+  );
+
+  const defaultAssetSymbol = token && inToken ? token.symbol : TEZ_ASSET.symbol;
+
+  const FeeOptionContent = useCallback(
+    (props: OptionRenderProps<FeeOption>) => (
+      <GenericFeeOptionContent
+        {...props}
+        assetSymbol={defaultAssetSymbol}
+        cryptoDecimals={
+          token?.decimals === undefined ? undefined : token.decimals - 1
+        }
+      />
+    ),
+    [token, defaultAssetSymbol]
+  );
+
+  const labelDescription = useMemo(
+    () =>
+      baseFee instanceof BigNumber && (
+        <T
+          id="feeInputDescription"
+          substitutions={[
+            <Fragment key={0}>
+              <span className="font-normal">
+                {toLocalFixed(baseFee)}
+                {defaultAssetSymbol === TEZ_ASSET.symbol
+                  ? ""
+                  : ` ${defaultAssetSymbol}`}
+              </span>
+            </Fragment>,
+          ]}
+        />
+      ),
+    [baseFee, defaultAssetSymbol]
   );
 
   return (
@@ -211,6 +331,14 @@ const AdditionalFeeInputContent: FC<AdditionalFeeInputContentProps> = (
         </label>
       ) : null}
 
+      <FormCheckbox
+        checked={inToken}
+        onChange={handleInTokenChange}
+        name="inToken"
+        label={"Pay fee in token"}
+        containerClassName={classNames("mb-4", !token && "hidden")}
+      />
+
       <div className="relative flex flex-col items-stretch">
         <CustomSelect
           activeItemId={selectedPreset}
@@ -225,15 +353,16 @@ const AdditionalFeeInputContent: FC<AdditionalFeeInputContentProps> = (
         />
 
         <AssetField
+          assetDecimals={token?.decimals}
           containerClassName={classNames(
             selectedPreset !== "custom" && "hidden",
             "mb-2"
           )}
           id={id}
-          onChange={onChange}
+          onChange={handleAmountChange}
           ref={customFeeInputRef}
-          assetSymbol={assetSymbol}
-          value={value}
+          assetSymbol={assetSymbol ?? defaultAssetSymbol}
+          value={amountFromValue}
           {...restProps}
         />
       </div>
@@ -256,8 +385,15 @@ const FeeOptionIcon: FC<OptionRenderProps<FeeOption>> = ({
   return <div style={{ width: 24, height: 24 }} />;
 };
 
-const FeeOptionContent: FC<OptionRenderProps<FeeOption>> = ({
+const GenericFeeOptionContent: FC<
+  OptionRenderProps<FeeOption> & {
+    assetSymbol: string;
+    cryptoDecimals?: number;
+  }
+> = ({
   item: { descriptionI18nKey, amount },
+  assetSymbol,
+  cryptoDecimals = 5,
 }) => {
   return (
     <>
@@ -272,8 +408,8 @@ const FeeOptionContent: FC<OptionRenderProps<FeeOption>> = ({
 
         {amount && (
           <div className="ml-2 leading-none text-gray-600">
-            <Money cryptoDecimals={5}>{amount}</Money>{" "}
-            <span style={{ fontSize: "0.75em" }}>{TEZ_ASSET.symbol}</span>
+            <Money cryptoDecimals={cryptoDecimals}>{amount}</Money>{" "}
+            <span style={{ fontSize: "0.75em" }}>{assetSymbol}</span>
           </div>
         )}
       </div>

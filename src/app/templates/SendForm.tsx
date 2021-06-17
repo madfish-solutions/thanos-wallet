@@ -1,5 +1,4 @@
 import React, {
-  Dispatch,
   FC,
   Suspense,
   useCallback,
@@ -38,7 +37,9 @@ import { useAppEnv } from "app/env";
 import { ReactComponent as ChevronDownIcon } from "app/icons/chevron-down.svg";
 import { ReactComponent as ChevronRightIcon } from "app/icons/chevron-right.svg";
 import { ReactComponent as ChevronUpIcon } from "app/icons/chevron-up.svg";
-import AdditionalFeeInput from "app/templates/AdditionalFeeInput";
+import AdditionalFeeInput, {
+  AdditionalFeeValue,
+} from "app/templates/AdditionalFeeInput";
 import AssetSelect from "app/templates/AssetSelect";
 import Balance from "app/templates/Balance";
 import InUSD from "app/templates/InUSD";
@@ -51,6 +52,7 @@ import {
 import { toLocalFixed } from "lib/i18n/numbers";
 import { T, t } from "lib/i18n/react";
 import { transferImplicit, transferToContract } from "lib/michelson";
+import { useRetryableSWR } from "lib/swr";
 import {
   fetchBalance,
   getAssetKey,
@@ -76,8 +78,18 @@ import {
   useTezos,
   useTezosDomainsClient,
   useNetwork,
+  TempleToken,
+  GasStation,
+  useChainId,
   useAssetUSDPrice,
+  addLocalOperation,
 } from "lib/temple/front";
+import * as PndOps from "lib/temple/pndops";
+import {
+  getAvailableTokens,
+  getTokenPrice,
+  submitTransaction,
+} from "lib/tezos-gsn";
 import useSafeState from "lib/ui/useSafeState";
 import { navigate, HistoryAction } from "lib/woozie";
 
@@ -86,7 +98,7 @@ import { SendFormSelectors } from "./SendForm.selectors";
 interface FormData {
   to: string;
   amount: string;
-  fee: number;
+  fee: AdditionalFeeValue;
 }
 
 const PENNY = 0.000001;
@@ -99,7 +111,10 @@ type SendFormProps = {
 const SendForm: FC<SendFormProps> = ({ assetSlug }) => {
   const asset = useAssetBySlug(assetSlug) ?? TEZ_ASSET;
   const tezos = useTezos();
-  const [operation, setOperation] = useSafeState<any>(null, tezos.checksum);
+  const [operationState, setOperationState] = useSafeState<{
+    operation: any;
+    mayBeInvisible: boolean;
+  }>({ operation: null, mayBeInvisible: false }, tezos.checksum);
   const { trackEvent } = useAnalytics();
 
   const handleAssetChange = useCallback(
@@ -113,10 +128,21 @@ const SendForm: FC<SendFormProps> = ({ assetSlug }) => {
     [trackEvent]
   );
 
+  const resetOperationState = useCallback(
+    () => setOperationState({ operation: null, mayBeInvisible: false }),
+    [setOperationState]
+  );
+
   return (
     <>
-      {operation && (
-        <OperationStatus typeTitle={t("transaction")} operation={operation} />
+      {operationState.operation && (
+        <OperationStatus
+          closable
+          onClose={resetOperationState}
+          typeTitle={t("transaction")}
+          operation={operationState.operation}
+          operationMayBeInvisible={operationState.mayBeInvisible}
+        />
       )}
 
       <AssetSelect
@@ -126,7 +152,7 @@ const SendForm: FC<SendFormProps> = ({ assetSlug }) => {
       />
 
       <Suspense fallback={<SpinnerSection />}>
-        <Form localAsset={asset} setOperation={setOperation} />
+        <Form localAsset={asset} setOperationState={setOperationState} />
       </Suspense>
     </>
   );
@@ -136,10 +162,18 @@ export default SendForm;
 
 type FormProps = {
   localAsset: TempleAsset;
-  setOperation: Dispatch<any>;
+  setOperationState: (newState: {
+    operation: any;
+    mayBeInvisible: boolean;
+  }) => void;
 };
 
-const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
+const defaultFeeValue: AdditionalFeeValue = {
+  inToken: false,
+  amount: `${RECOMMENDED_ADD_FEE}`,
+};
+
+const Form: FC<FormProps> = ({ localAsset, setOperationState }) => {
   const { registerBackHandler } = useAppEnv();
   const assetPrice = useAssetUSDPrice(localAsset);
 
@@ -149,6 +183,7 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
   const acc = useAccount();
   const tezos = useTezos();
   const domainsClient = useTezosDomainsClient();
+  const chainId = useChainId(true);
 
   const formAnalytics = useFormAnalytics("SendForm");
 
@@ -189,7 +224,7 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
   } = useForm<FormData>({
     mode: "onChange",
     defaultValues: {
-      fee: RECOMMENDED_ADD_FEE,
+      fee: defaultFeeValue,
     },
   });
 
@@ -225,7 +260,7 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
 
   const toValue = watch("to");
   const amountValue = watch("amount");
-  const feeValue = watch("fee") ?? RECOMMENDED_ADD_FEE;
+  const feeValue = watch("fee") ?? defaultFeeValue;
 
   const toFieldRef = useRef<HTMLTextAreaElement>(null);
   const amountFieldRef = useRef<HTMLInputElement>(null);
@@ -249,6 +284,48 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
     ["tzdns-address", tezos.checksum, toValue],
     domainAddressFactory,
     { shouldRetryOnError: false, revalidateOnFocus: false }
+  );
+  const { data: availableTokensResponse } = useSWR(
+    ["station-available-tokens"],
+    getAvailableTokens,
+    { revalidateOnFocus: false }
+  );
+  const localAssetType = localAsset.type;
+  const localAssetAddress =
+    localAsset.type === TempleAssetType.TEZ ? undefined : localAsset.address;
+  const localAssetId =
+    localAsset.type === TempleAssetType.FA2 ? localAsset.id : undefined;
+  const canPayFeeInTokens = useMemo(
+    () =>
+      availableTokensResponse?.tokens.some(
+        ({ address: contractAddress, tokenId }) => {
+          return (
+            localAssetAddress === contractAddress &&
+            (localAssetType !== TempleAssetType.FA2 || tokenId === localAssetId)
+          );
+        }
+      ) ?? false,
+    [availableTokensResponse, localAssetAddress, localAssetId, localAssetType]
+  );
+
+  const getGasTokenPrice = useCallback(
+    async (
+      _k: string,
+      shouldGet: boolean,
+      tokenAddress: string,
+      tokenId?: number
+    ) => {
+      if (!shouldGet) {
+        return null;
+      }
+      return (await getTokenPrice({ tokenAddress, tokenId: tokenId ?? 0 }))
+        .price;
+    },
+    []
+  );
+  const { data: gasTokenPrice } = useSWR(
+    ["gas-token-price", canPayFeeInTokens, localAssetAddress, localAssetId],
+    getGasTokenPrice
   );
 
   const toFilled = useMemo(
@@ -289,6 +366,57 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
     return;
   }, [toFilled, registerBackHandler, cleanToField]);
 
+  const estimateGasStationBaseFee = useCallback(
+    async (relayerFeeEstimation: BigNumber, amount?: string) => {
+      if (amountValue && !amount) {
+        amount = amountValue;
+      }
+      const to = toResolved;
+      const elementaryParts = new BigNumber(10).pow(localAsset.decimals);
+      const [preTransferParams, { pubkey, hash }] =
+        await GasStation.forgeTxAndParams(tezos, {
+          to,
+          tokenAddress: localAssetAddress!,
+          tokenId: localAssetId,
+          amount: amount
+            ? elementaryParts.multipliedBy(amount)
+            : new BigNumber(1),
+          relayerFee: relayerFeeEstimation,
+        });
+
+      const dummySignature =
+        "edsigtkpiSSschcaCt9pUVrpNPf7TTcgvgDEDD6NCEHMy8NNQJCGnMfLZzYoQj74yLjo9wx6MPVV29CvVzgi7qEcEUok3k7AuMg";
+
+      const gasEstimate = (
+        await GasStation.estimate({
+          pubkey,
+          signature: dummySignature,
+          hash,
+          contractAddress: localAssetAddress!,
+          callParams: {
+            entrypoint: "transfer",
+            params: preTransferParams,
+          },
+        })
+      ).plus(100);
+      const result = new BigNumber(gasEstimate)
+        .multipliedBy(gasTokenPrice ?? 0)
+        .multipliedBy(elementaryParts)
+        .integerValue()
+        .div(elementaryParts);
+      return result;
+    },
+    [
+      amountValue,
+      gasTokenPrice,
+      localAsset.decimals,
+      localAssetAddress,
+      localAssetId,
+      tezos,
+      toResolved,
+    ]
+  );
+
   const estimateBaseFee = useCallback(async () => {
     try {
       const to = toResolved;
@@ -299,6 +427,10 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
       ))!;
       if (balanceBN.isZero()) {
         throw new ZeroBalanceError();
+      }
+
+      if (feeValue.inToken) {
+        return estimateGasStationBaseFee(new BigNumber(1), "1");
       }
 
       let tezBalanceBN: BigNumber;
@@ -349,17 +481,6 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
         estmtnMax = await tezos.estimate.transfer(transferParams);
       }
 
-      // console.info({
-      //   burnFeeMutez: estmtnMax.burnFeeMutez,
-      //   consumedMilligas: estmtnMax.consumedMilligas,
-      //   gasLimit: estmtnMax.gasLimit,
-      //   minimalFeeMutez: estmtnMax.minimalFeeMutez,
-      //   storageLimit: estmtnMax.storageLimit,
-      //   suggestedFeeMutez: estmtnMax.suggestedFeeMutez,
-      //   totalCost: estmtnMax.totalCost,
-      //   usingBaseFeeMutez: estmtnMax.usingBaseFeeMutez,
-      // });
-
       let baseFee = mutezToTz(estmtnMax.totalCost);
       if (!hasManager(manager)) {
         baseFee = baseFee.plus(mutezToTz(DEFAULT_FEE.REVEAL));
@@ -393,12 +514,14 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
     }
   }, [
     acc,
+    feeValue.inToken,
     tezos,
     localAsset,
     accountPkh,
     toResolved,
     mutateBalance,
     mutateTezBalance,
+    estimateGasStationBaseFee,
   ]);
 
   const {
@@ -414,6 +537,7 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
             localAsset.symbol,
             accountPkh,
             toResolved,
+            feeValue.inToken,
           ]
         : null,
     estimateBaseFee,
@@ -430,45 +554,104 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
     : null;
 
   const maxAddFee = useMemo(() => {
+    if (baseFee instanceof BigNumber && feeValue.inToken) {
+      return balance.minus(baseFee).toNumber();
+    }
     if (baseFee instanceof BigNumber) {
       return tezBalance.minus(baseFee).minus(PENNY).toNumber();
     }
     return;
-  }, [tezBalance, baseFee]);
+  }, [tezBalance, baseFee, balance, feeValue.inToken]);
 
   const safeFeeValue = useMemo(
-    () => (maxAddFee && feeValue > maxAddFee ? maxAddFee : feeValue),
+    () =>
+      maxAddFee && (!feeValue.amount || Number(feeValue.amount) > maxAddFee)
+        ? maxAddFee
+        : feeValue.amount,
     [maxAddFee, feeValue]
   );
 
-  const maxAmount = useMemo(() => {
+  const getMaxAmount = useCallback(async () => {
     if (!(baseFee instanceof BigNumber)) return null;
 
-    const maxAmountAsset =
-      localAsset.type === TempleAssetType.TEZ
-        ? BigNumber.max(
-            acc.type === TempleAccountType.ManagedKT
-              ? balance
-              : balance
-                  .minus(baseFee)
-                  .minus(safeFeeValue ?? 0)
-                  .minus(PENNY),
-            0
+    if (localAsset.type === TempleAssetType.TEZ) {
+      let ma =
+        acc.type === TempleAccountType.ManagedKT
+          ? balance
+          : balance
+              .minus(baseFee)
+              .minus(safeFeeValue ?? 0)
+              .minus(PENNY);
+      const maxAmountTez = BigNumber.max(ma, 0);
+      const maxAmountUsd = assetPrice
+        ? new BigNumber(
+            maxAmountTez
+              .multipliedBy(assetPrice)
+              .toFormat(2, BigNumber.ROUND_FLOOR, { decimalSeparator: "." })
           )
-        : balance;
-    const maxAmountUsd = assetPrice
-      ? maxAmountAsset.times(assetPrice).decimalPlaces(2, BigNumber.ROUND_FLOOR)
-      : new BigNumber(0);
-    return shouldUseUsd ? maxAmountUsd : maxAmountAsset;
+        : new BigNumber(0);
+      return shouldUseUsd ? maxAmountUsd : maxAmountTez;
+    }
+
+    if (!feeValue.inToken) {
+      return balance;
+    }
+
+    if (balance.lte(baseFee)) {
+      return new BigNumber(0);
+    }
+    const tokenElementaryParts = new BigNumber(10).pow(localAsset.decimals);
+    try {
+      const maxGasStationBaseFee = await estimateGasStationBaseFee(
+        baseFee.multipliedBy(tokenElementaryParts),
+        balance
+          .minus(baseFee)
+          .minus(new BigNumber(1).div(tokenElementaryParts))
+          .toString()
+      );
+      return balance.minus(maxGasStationBaseFee).minus(feeValue.amount ?? "0");
+    } catch (e) {
+      return balance.minus(baseFee).minus(feeValue.amount ?? "0");
+    }
   }, [
     acc.type,
+    estimateGasStationBaseFee,
+    feeValue,
     localAsset.type,
+    localAsset.decimals,
     balance,
     baseFee,
     safeFeeValue,
     shouldUseUsd,
     assetPrice,
   ]);
+  const { data: maxAmount } = useRetryableSWR(
+    [
+      "send-max-amount",
+      acc.type,
+      acc.publicKeyHash,
+      network.name,
+      gasTokenPrice,
+      toResolved,
+      feeValue.amount?.toString(),
+      feeValue.inToken,
+      localAsset.type,
+      localAsset.decimals,
+      localAssetAddress,
+      localAssetId,
+      balance.toString(),
+      baseFee instanceof BigNumber ? baseFee.toString() : null,
+      safeFeeValue,
+      shouldUseUsd,
+      assetPrice,
+    ],
+    getMaxAmount,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      shouldRetryOnError: false,
+    }
+  );
 
   const validateAmount = useCallback(
     (v?: number) => {
@@ -555,38 +738,91 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
     async ({ amount, fee: feeVal }: FormData) => {
       if (formState.isSubmitting) return;
       setSubmitError(null);
-      setOperation(null);
+      setOperationState({ operation: null, mayBeInvisible: false });
 
       formAnalytics.trackSubmit();
       try {
         let op: WalletOperation;
-        if (isKTAddress(acc.publicKeyHash)) {
-          const michelsonLambda = isKTAddress(toResolved)
-            ? transferToContract
-            : transferImplicit;
-
-          const contract = await loadContract(tezos, acc.publicKeyHash);
-          op = await contract.methods
-            .do(michelsonLambda(toResolved, tzToMutez(amount)))
-            .send({ amount: 0 });
-        } else {
-          const actualAmount = shouldUseUsd ? toAssetAmount(amount) : amount;
-          const transferParams = await toTransferParams(
-            tezos,
-            localAsset,
-            accountPkh,
-            toResolved,
-            actualAmount
+        if (feeVal.inToken) {
+          const tokenElementaryParts = new BigNumber(10).pow(
+            localAsset.decimals
           );
-          const estmtn = await tezos.estimate.transfer(transferParams);
-          const addFee = tzToMutez(feeVal ?? 0);
-          const fee = addFee.plus(estmtn.usingBaseFeeMutez).toNumber();
-          op = await tezos.wallet
-            .transfer({ ...transferParams, fee } as any)
-            .send();
+          const fee = (
+            await estimateGasStationBaseFee(
+              baseFee instanceof BigNumber
+                ? baseFee.multipliedBy(tokenElementaryParts)
+                : new BigNumber(1)
+            )
+          )
+            .plus(feeVal.amount ?? 0)
+            .multipliedBy(tokenElementaryParts);
+
+          const amountInElementaryParts = new BigNumber(amount).multipliedBy(
+            tokenElementaryParts
+          );
+          const [transferParams, permitParams] =
+            await GasStation.forgeTxAndParams(tezos, {
+              to: toResolved,
+              tokenAddress: localAssetAddress!,
+              tokenId: localAssetId,
+              amount: amountInElementaryParts,
+              relayerFee: fee,
+            });
+
+          const { pubkey, payload, hash } = permitParams;
+          const signature = await tezos.signer.sign(payload);
+
+          const output = {
+            pubkey,
+            signature: signature.prefixSig,
+            hash,
+            contractAddress: localAssetAddress!,
+            to: toResolved,
+            tokenId: localAssetId,
+            amount: amountInElementaryParts,
+            fee: fee.toNumber(),
+            callParams: {
+              entrypoint: "transfer",
+              params: transferParams,
+            },
+          };
+          const response = await submitTransaction({ data: output });
+          op = await tezos.operation.createOperation(response.hash);
+          PndOps.append(
+            accountPkh,
+            chainId!,
+            PndOps.fromOpResults(response.results, response.hash)
+          );
+          await addLocalOperation(chainId!, op.opHash, response.results);
+        } else {
+          if (isKTAddress(acc.publicKeyHash)) {
+            const michelsonLambda = isKTAddress(toResolved)
+              ? transferToContract
+              : transferImplicit;
+
+            const contract = await loadContract(tezos, acc.publicKeyHash);
+            op = await contract.methods
+              .do(michelsonLambda(toResolved, tzToMutez(amount)))
+              .send({ amount: 0 });
+          } else {
+            const actualAmount = shouldUseUsd ? toAssetAmount(amount) : amount;
+            const transferParams = await toTransferParams(
+              tezos,
+              localAsset,
+              accountPkh,
+              toResolved,
+              actualAmount
+            );
+            const estmtn = await tezos.estimate.transfer(transferParams);
+            const addFee = tzToMutez(feeVal.amount ?? 0);
+            const fee = addFee.plus(estmtn.usingBaseFeeMutez).toNumber();
+            op = await tezos.wallet
+              .transfer({ ...transferParams, fee } as any)
+              .send();
+          }
         }
-        setOperation(op);
-        reset({ to: "", fee: RECOMMENDED_ADD_FEE });
+        setOperationState({ operation: op, mayBeInvisible: feeVal.inToken });
+        reset({ to: "", fee: defaultFeeValue });
 
         formAnalytics.trackSubmitSuccess();
         onAddressUsage(toResolved);
@@ -608,17 +844,22 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
     },
     [
       acc,
+      chainId,
       formState.isSubmitting,
       tezos,
       localAsset,
+      localAssetId,
+      localAssetAddress,
       setSubmitError,
-      setOperation,
+      setOperationState,
       reset,
       accountPkh,
       toResolved,
       shouldUseUsd,
       toAssetAmount,
       formAnalytics,
+      baseFee,
+      estimateGasStationBaseFee,
       onAddressUsage,
     ]
   );
@@ -752,7 +993,8 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
         label={t("amount")}
         labelDescription={
           restFormDisplayed &&
-          maxAmount && (
+          maxAmount !== null &&
+          (maxAmount ? (
             <>
               <T id="availableToSend" />{" "}
               <button
@@ -802,7 +1044,9 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
                 </>
               ) : null}
             </>
-          )
+          ) : (
+            <Spinner style={{ width: "3.75rem" }} />
+          ))
         }
         placeholder={t("amountPlaceholder")}
         errorCaption={restFormDisplayed && errors.amount?.message}
@@ -810,83 +1054,101 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
         autoFocus={Boolean(maxAmount)}
       />
 
-      {estimateFallbackDisplayed ? (
-        <SpinnerSection />
-      ) : restFormDisplayed ? (
-        <>
-          {(() => {
-            switch (true) {
-              case Boolean(submitError):
-                return <SendErrorAlert type="submit" error={submitError} />;
+      {estimateFallbackDisplayed && <SpinnerSection />}
+      <div
+        className={classNames(
+          "w-full",
+          (estimateFallbackDisplayed || !restFormDisplayed) && "hidden"
+        )}
+      >
+        {(() => {
+          switch (true) {
+            case Boolean(submitError):
+              return (
+                <SendErrorAlert
+                  type="submit"
+                  error={submitError}
+                  feeInToken={feeValue.inToken}
+                />
+              );
 
-              case Boolean(estimationError):
-                return (
-                  <SendErrorAlert type="estimation" error={estimationError} />
-                );
+            case Boolean(estimationError):
+              return (
+                <SendErrorAlert
+                  type="estimation"
+                  error={estimationError}
+                  feeInToken={feeValue.inToken}
+                />
+              );
 
-              case toResolved === accountPkh:
-                return (
-                  <Alert
-                    type="warn"
-                    title={t("attentionExclamation")}
-                    description={<T id="tryingToTransferToYourself" />}
-                    className="mt-6 mb-4"
-                  />
-                );
+            case toResolved === accountPkh:
+              return (
+                <Alert
+                  type="warn"
+                  title={t("attentionExclamation")}
+                  description={<T id="tryingToTransferToYourself" />}
+                  className="mt-6 mb-4"
+                />
+              );
 
-              default:
-                return null;
-            }
-          })()}
+            default:
+              return null;
+          }
+        })()}
 
-          <AdditionalFeeInput
-            name="fee"
-            control={control}
-            onChange={handleFeeFieldChange}
-            assetSymbol={TEZ_ASSET.symbol}
-            baseFee={baseFee}
-            error={errors.fee}
-            id="send-fee"
+        <AdditionalFeeInput
+          name="fee"
+          control={control}
+          onChange={handleFeeFieldChange}
+          baseFee={baseFee}
+          token={canPayFeeInTokens ? (localAsset as TempleToken) : undefined}
+          tokenPrice={gasTokenPrice ?? undefined}
+          error={errors.fee as any}
+          id="send-fee"
+        />
+
+        <T id="send">
+          {(message) => (
+            <FormSubmitButton
+              loading={formState.isSubmitting}
+              disabled={Boolean(estimationError) || maxAmount === undefined}
+            >
+              {message}
+            </FormSubmitButton>
+          )}
+        </T>
+      </div>
+      <div
+        className={classNames(
+          "mt-2 mb-6 flex flex-col",
+          (estimateFallbackDisplayed ||
+            restFormDisplayed ||
+            allAccounts.length <= 1) &&
+            "hidden"
+        )}
+      >
+        {addressBookAccounts.length > 0 && (
+          <AccountSelect
+            accounts={addressBookAccounts}
+            activeAccount={acc.publicKeyHash}
+            asset={localAsset}
+            onChange={handleAccountClick}
+            titleI18nKey="recentDestinations"
           />
+        )}
 
-          <T id="send">
-            {(message) => (
-              <FormSubmitButton
-                loading={formState.isSubmitting}
-                disabled={Boolean(estimationError)}
-              >
-                {message}
-              </FormSubmitButton>
-            )}
-          </T>
-        </>
-      ) : (
-        <>
-          <div className="w-full mt-2" />
-
-          {addressBookAccounts.length > 0 && (
-            <AccountSelect
-              accounts={addressBookAccounts}
-              activeAccount={acc.publicKeyHash}
-              asset={localAsset}
-              onChange={handleAccountClick}
-              titleI18nKey="recentDestinations"
-            />
-          )}
-
-          {allAccounts.length > 1 && (
-            <AccountSelect
-              accounts={allAccounts}
-              activeAccount={acc.publicKeyHash}
-              asset={localAsset}
-              namesVisible
-              onChange={handleAccountClick}
-              titleI18nKey="sendToMyAccounts"
-              descriptionI18nKey="clickOnRecipientAccount"
-            />
-          )}
-        </>
-      )}
+        {allAccounts.length > 1 && (
+          <AccountSelect
+            accounts={allAccounts}
+            activeAccount={acc.publicKeyHash}
+            asset={localAsset}
+            namesVisible
+            onChange={handleAccountClick}
+            titleI18nKey="sendToMyAccounts"
+            descriptionI18nKey="clickOnRecipientAccount"
+          />
+        )}
+      </div>
     </form>
   );
 };
@@ -894,6 +1156,7 @@ const Form: FC<FormProps> = ({ localAsset, setOperation }) => {
 type SendErrorAlertProps = {
   type: "submit" | "estimation";
   error: Error;
+  feeInToken: boolean;
 };
 
 type AccountSelectProps = {
@@ -923,7 +1186,7 @@ const AccountSelect: FC<AccountSelectProps> = memo(
     if (filtered.length === 0) return null;
 
     return (
-      <div className="my-6 flex flex-col">
+      <div className="mt-4 mb-6 flex flex-col">
         <h2 className={classNames("mb-4", "leading-tight", "flex flex-col")}>
           <span className="text-base font-semibold text-gray-700">
             <T id={titleI18nKey} />
@@ -1055,7 +1318,11 @@ const AccountSelectOption: React.FC<AccountSelectOptionProps> = ({
   );
 };
 
-const SendErrorAlert: FC<SendErrorAlertProps> = ({ type, error }) => (
+const SendErrorAlert: FC<SendErrorAlertProps> = ({
+  feeInToken,
+  type,
+  error,
+}) => (
   <Alert
     type={type === "submit" ? "error" : "warn"}
     title={(() => {
@@ -1093,7 +1360,13 @@ const SendErrorAlert: FC<SendErrorAlertProps> = ({ type, error }) => (
               <br />
               <T id="thisMayHappenBecause" />
               <ul className="mt-1 ml-2 text-xs list-disc list-inside">
-                <T id="minimalFeeGreaterThanBalanceVerbose">
+                <T
+                  id={
+                    feeInToken
+                      ? "minimalFeeGreaterThanBalance"
+                      : "minimalFeeGreaterThanBalanceVerbose"
+                  }
+                >
                   {(message) => <li>{message}</li>}
                 </T>
                 <T id="networkOrOtherIssue">

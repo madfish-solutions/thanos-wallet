@@ -1873,6 +1873,9 @@
   "storageFee": {
     "message": "Storage fee"
   },
+  "operationMayBeNotVisibleWarning": {
+    "message": "The feature is experimental, so the operation may be not visible in 'Activity' tab or may be displayed not as usual"
+  },
   "templeWalletFeeWarning": {
     "message": "Temple Wallet doesn't apply any fees to exchanges for now but it may apply in the future."
   },

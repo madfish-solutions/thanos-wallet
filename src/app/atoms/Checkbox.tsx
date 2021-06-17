@@ -1,4 +1,11 @@
-import React, { forwardRef, InputHTMLAttributes, useCallback, useState } from "react";
+import React, {
+  forwardRef,
+  InputHTMLAttributes,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import classNames from "clsx";
 
@@ -23,9 +30,8 @@ const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(
     },
     ref
   ) => {
-    const [localChecked, setLocalChecked] = useState(
-      () => checked || false
-    );
+    const prevChecked = useRef(checked || false);
+    const [localChecked, setLocalChecked] = useState(() => checked || false);
     const handleChange = useCallback(
       (evt) => {
         if (onChange) {
@@ -39,6 +45,13 @@ const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(
       },
       [onChange, setLocalChecked]
     );
+
+    useEffect(() => {
+      if (prevChecked.current !== checked) {
+        setLocalChecked(checked || false);
+      }
+      prevChecked.current = checked || false;
+    }, [checked]);
 
     /**
      * Focus handling

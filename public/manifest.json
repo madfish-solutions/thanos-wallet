@@ -27,6 +27,7 @@
     "https://*.tzkt.io/",
     "https://api.baking-bad.org/v2/",
     "https://api.templewallet.com/",
+    "http://167.99.133.200:8732/",
     "https://quipuswap.com/"
   ],
   "content_security_policy": "script-src 'self' 'unsafe-eval'; object-src 'self'",

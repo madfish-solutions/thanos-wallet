@@ -20,11 +20,13 @@ type OperationStatusProps = {
   onClose?: () => void;
   typeTitle: string;
   operation: any;
+  operationMayBeInvisible?: boolean;
 };
 
 const OperationStatus: FC<OperationStatusProps> = ({
   typeTitle,
   operation,
+  operationMayBeInvisible,
   className,
   closable,
   onClose,
@@ -68,6 +70,11 @@ const OperationStatus: FC<OperationStatusProps> = ({
     description: (
       <>
         <T id="requestSent" substitutions={typeTitle} />
+        {operationMayBeInvisible && (
+          <p>
+            <T id="operationMayBeNotVisibleWarning" />
+          </p>
+        )}
         {descFooter}
         <div className="flex-1" />
       </>
@@ -90,6 +97,11 @@ const OperationStatus: FC<OperationStatusProps> = ({
                 id="operationSuccessfullyProcessed"
                 substitutions={typeTitle}
               />
+              {operationMayBeInvisible && (
+                <p>
+                  <T id="operationMayBeNotVisibleWarning" />
+                </p>
+              )}
               {descFooter}
             </>
           ),
@@ -113,6 +125,7 @@ const OperationStatus: FC<OperationStatusProps> = ({
     hash,
     setAlert,
     descFooter,
+    operationMayBeInvisible,
     typeTitle,
   ]);
 
