@@ -1,4 +1,9 @@
-import { TezosToolkit, WalletContract, compose } from "@taquito/taquito";
+import {
+  TezosToolkit,
+  WalletContract,
+  compose,
+  BigMapAbstraction,
+} from "@taquito/taquito";
 import { tzip12 } from "@taquito/tzip12";
 import { tzip16 } from "@taquito/tzip16";
 import memoize from "micro-memoize";
@@ -54,6 +59,13 @@ export async function fetchTokenMetadata(
       latestErrMessage = err.message;
     }
   }
+
+  try {
+    const { tokens } = await contract.storage<any>();
+    if (tokens instanceof BigMapAbstraction && tokenId !== undefined) {
+      tokenData = await tokens.get(tokenId);
+    }
+  } catch (e) {}
 
   if (!tokenData) {
     throw new MetadataParseError(latestErrMessage ?? "Unknown error");
