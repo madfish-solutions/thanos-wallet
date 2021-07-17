@@ -107,6 +107,16 @@ export const MAINNET_TOKENS: TempleToken[] = [
   },
   {
     type: TempleAssetType.FA1_2,
+    address: "KT1JkoE42rrMBP9b2oDhbx6EUr26GcySZMUH",
+    name: "Kolibri DAO Token",
+    symbol: "kDAO",
+    decimals: 18,
+    fungible: true,
+    iconUrl: "https://kolibri-data.s3.amazonaws.com/kdao-logo.png",
+    status: "displayed",
+  },  
+  {
+    type: TempleAssetType.FA1_2,
     address: "KT1VYsVfmobT7rsMVivvZ4J8i3bPiqz12NaH",
     name: "Wrapped Tezos",
     symbol: "wXTZ",
